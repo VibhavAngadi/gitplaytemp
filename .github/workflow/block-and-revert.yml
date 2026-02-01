@@ -1,0 +1,340 @@
+name: block-direct-push
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: block-direct-push-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  # Note: writing workflow files may require a PAT with workflow scope (see notes below).
+
+env:
+  REPO: ${{ github.repository }}
+  GITHUB_API: https://api.github.com
+
+jobs:
+  detect-and-revert:
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      !contains(github.event.head_commit.message, '[auto-revert]') &&
+      !contains(github.event.head_commit.message, '[auto-reapply]')
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.set_outputs.outputs.should_run }}
+      revert_pr_number: ${{ steps.set_outputs.outputs.revert_pr_number }}
+      revert_branch: ${{ steps.set_outputs.outputs.revert_branch }}
+      touches_workflows: ${{ steps.set_outputs.outputs.touches_workflows }}
+
+    steps:
+      - name: "Debug: event & push"
+        run: |
+          echo "PUSH SHA: $GITHUB_SHA"
+          echo "Repository: $REPO"
+          echo "Event path: $GITHUB_EVENT_PATH"
+          echo "Event type: $GITHUB_EVENT_NAME"
+          echo "Commits:"
+          jq -r '.commits[]? | "\(.id) \(.message)"' "$GITHUB_EVENT_PATH" || true
+      
+      - name: Abort early for automation commits
+        id: automation_guard
+        run: |
+          if echo "${{ github.event.head_commit.message }}" | grep -Eq '\[(auto-revert|auto-reapply)\]'; then
+            echo "Automation commit detected. Skipping enforcement."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          fi
+
+
+      - name: Get list of files changed in push
+        id: detect_files
+        run: |
+          set -euo pipefail
+          # Collect changed files across all commits
+          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$GITHUB_EVENT_PATH" 2>/dev/null | sort -u || true)
+          echo "FILES<<EOF" >> $GITHUB_OUTPUT
+          echo "$files" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          if echo "$files" | grep -q '^\.github/workflows/'; then
+            echo "touches_workflows=true" >> $GITHUB_OUTPUT
+          else
+            echo "touches_workflows=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check whether commit is associated with a PR
+        id: check_pr
+        run: |
+          set -euo pipefail
+          resp=$(curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ github.token }}" \
+            "${{ env.GITHUB_API }}/repos/${{ env.REPO }}/commits/${GITHUB_SHA}/pulls")
+          echo "$resp" > pulls.json
+          count=$(jq 'length' pulls.json)
+          echo "pulls_count=$count" >> $GITHUB_OUTPUT
+
+      - name: Abort if this push came from a PR merge
+        if: steps.check_pr.outputs.pulls_count != '0'
+        run: |
+          echo "Commit is associated with a PR. Skipping enforcement."
+          echo "should_run=false" >> $GITHUB_OUTPUT
+
+
+      - name: Prepare auth token (ADMIN_PAT preferred when workflows changed)
+        id: auth
+        run: |
+          # Prefer ADMIN_PAT (repo+workflow scopes) when present; else fall back to GITHUB_TOKEN
+          AUTH="${{ secrets.ADMIN_PAT }}"
+          if [ -z "$AUTH" ]; then
+            echo "ADMIN_PAT not present; falling back to github.token (may be insufficient to push workflow file changes)."
+            AUTH="${{ github.token }}"
+          else
+            echo "Using ADMIN_PAT for repo operations."
+          fi
+          echo "auth_token=$AUTH" >> $GITHUB_OUTPUT
+
+      - name: Create revert branch & PR (revert direct push)
+        if: |
+          steps.check_pr.outputs.pulls_count == '0' &&
+          steps.automation_guard.outputs.should_run != 'false'
+
+        id: revert
+        env:
+          AUTH_TOKEN: ${{ steps.auth.outputs.auth_token }}
+          REPO: ${{ env.REPO }}
+          GITHUB_API: ${{ env.GITHUB_API }}
+        run: |
+          set -euo pipefail
+
+          # Find changed files again (safer than relying on job output interpolation)
+          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$GITHUB_EVENT_PATH" 2>/dev/null | sort -u || true)
+
+          # If workflows were touched but token lacks workflow scope, exit so human can set ADMIN_PAT
+          if echo "$files" | grep -q '^\.github/workflows/'; then
+            # We check whether the provided token is the default GITHUB_TOKEN by comparing to empty ADMIN_PAT
+            if [ -z "${{ secrets.ADMIN_PAT }}" ]; then
+              echo "Direct push touched .github/workflows/. A PAT with workflow scope (ADMIN_PAT) is required for operations that modify workflow files."
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+
+          # Load commits in reverse order (newest first) so git revert succeeds without conflicts
+          commits=$(jq -r '.commits | reverse | .[].id' "$GITHUB_EVENT_PATH")
+          if [ -z "$commits" ]; then
+            echo "No commits found in event payload; nothing to revert."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Detected direct push to main (no associated PR). Will create a revert branch and open a PR."
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          # checkout full repo history using actions/checkout equivalent via git clone (explicit token avoids relying on checkout step)
+          SHORT_SHA=${GITHUB_SHA::7}
+          BRANCH="revert/direct-push-${SHORT_SHA}"
+          git clone --no-tags "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git fetch --all
+          git checkout main
+
+          git checkout -b "$BRANCH"
+
+          for c in $commits; do
+            echo "Reverting commit $c"
+            if git show -s --format=%P "$c" | grep -q ' '; then
+              # Real merge commit (GitHub PR merge)
+              git revert --no-edit -m 1 "$c"
+            else
+              # Normal commit (even if message says "Merge pull request")
+              git revert --no-edit "$c"
+            fi
+
+            git commit --amend -m "[auto-revert] Revert direct push $c"
+          done
+
+          # push revert branch
+          git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
+
+          title="Revert direct push ${SHORT_SHA} to main"
+          body="Automated revert PR: created because commits were pushed directly to main without a PR.\n\nDirect push SHA: ${GITHUB_SHA}\n\nPlease review & merge to restore repository state."
+
+          create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API}/repos/${REPO}/pulls" \
+            -d "$(jq -n --arg t "$title" --arg b "$body" --arg h "$BRANCH" '{title:$t, head:$h, base:"main", body:$b}')")
+
+          echo "create_resp:"
+          echo "$create_resp" | jq .
+
+          pr_number=$(echo "$create_resp" | jq -r '.number // empty')
+          if [ -z "$pr_number" ]; then
+            echo "Failed to create revert PR. Response:"
+            echo "$create_resp"
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "revert_pr_number=$pr_number" >> $GITHUB_OUTPUT
+          echo "revert_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "should_run=true" >> $GITHUB_OUTPUT
+          if echo "$files" | grep -q '^\.github/workflows/'; then
+            echo "touches_workflows=true" >> $GITHUB_OUTPUT
+          else
+            echo "touches_workflows=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Ensure stable job outputs (aggregator)
+        id: set_outputs
+        run: |
+          # Default values (in case earlier steps didn't run)
+          should_run=false
+          revert_pr_number=
+          revert_branch=
+          touches_workflows=false
+
+          # If revert step ran and wrote outputs to $GITHUB_OUTPUT, those environment variables are available
+          # Read any values we already exported earlier (GITHUB_OUTPUT variables are mapped to step outputs above)
+          # Use the existing step outputs that may have been set above (GitHub maps them into step outputs when using "echo ... >> $GITHUB_OUTPUT")
+          # We query actions step outputs via environment variables exposed to later steps in the same job.
+          # Fallback: inspect file-based outputs (not always available), but we keep robust defaults.
+
+          # Try to read from the revert step output file (if created)
+          if [ -f "${RUNNER_TEMP}/_github_workflow_revert_output" ]; then
+            echo "found temp revert output"
+          fi
+
+          # Instead, rely on previously echoed $GITHUB_OUTPUT (GitHub makes them available as step outputs in this job)
+          # Read possible step outputs (they exist if the steps ran)
+          if [ -n "${{ steps.revert.outputs.should_run || '' }}" ]; then
+            should_run="${{ steps.revert.outputs.should_run }}"
+          elif [ -n "${{ steps.skip.outputs.should_run || '' }}" ]; then
+            should_run="${{ steps.skip.outputs.should_run }}"
+          fi
+
+          revert_pr_number="${{ steps.revert.outputs.revert_pr_number || '' }}"
+          revert_branch="${{ steps.revert.outputs.revert_branch || '' }}"
+          touches_workflows="${{ steps.revert.outputs.touches_workflows || steps.detect_files.outputs.touches_workflows || 'false' }}"
+
+          echo "should_run=$should_run" >> $GITHUB_OUTPUT
+          echo "revert_pr_number=$revert_pr_number" >> $GITHUB_OUTPUT
+          echo "revert_branch=$revert_branch" >> $GITHUB_OUTPUT
+          echo "touches_workflows=$touches_workflows" >> $GITHUB_OUTPUT
+
+  approve-and-reapply:
+    needs: detect-and-revert
+    if: |
+      needs.detect-and-revert.outputs.should_run == 'true' &&
+      needs.detect-and-revert.outputs.revert_pr_number != ''
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      GITHUB_API: https://api.github.com
+      AUTH_TOKEN: ${{ secrets.ADMIN_PAT || github.token }}
+      REVERT_PR_NUMBER: ${{ needs.detect-and-revert.outputs.revert_pr_number }}
+      REVERT_BRANCH: ${{ needs.detect-and-revert.outputs.revert_branch }}
+      TOUCHES_WORKFLOWS: ${{ needs.detect-and-revert.outputs.touches_workflows }}
+    steps:
+      - name: Merge revert PR
+        run: |
+          set -euo pipefail
+          if [ -z "${REVERT_PR_NUMBER}" ]; then
+            echo "Missing revert PR number."
+            exit 1
+          fi
+
+          # Attempt to merge the revert PR (this will fail if branch protections require reviews)
+          payload=$(jq -n --arg method "${{ vars.REVERT_MERGE_METHOD || 'merge' }}" '{merge_method:$method}')
+          resp=$(curl -s -X PUT -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API}/repos/${REPO}/pulls/${REVERT_PR_NUMBER}/merge" \
+            -d "$payload")
+
+          merged=$(echo "$resp" | jq -r '.merged // false')
+          merge_sha=$(echo "$resp" | jq -r '.sha // empty')
+
+          if [ "$merged" != "true" ]; then
+            echo "Revert PR not merged. Stopping workflow."
+            exit 0
+          fi
+
+          if [ -z "$merge_sha" ]; then
+            echo "Could not determine revert merge commit SHA."
+            exit 1
+          fi
+
+          echo "REVERT_MERGE_SHA=$merge_sha" >> $GITHUB_ENV
+
+      - name: Reapply commits as a PR (cherry-pick original commits into a PR)
+        run: |
+          set -euo pipefail
+
+          # Do not auto-reapply workflow changes
+          if [ "${TOUCHES_WORKFLOWS}" = "true" ]; then
+            echo "Workflow files changed. Reapply must be manual."
+            exit 0
+          fi
+
+          if [ "${TOUCHES_WORKFLOWS}" = "true" ] && [ -z "${{ secrets.ADMIN_PAT }}" ]; then
+            echo "Reapply would touch .github/workflows/. Set ADMIN_PAT with repo+workflow scopes."
+            exit 1
+          fi
+
+          commits=$(jq -r '.commits | .[].id' "$GITHUB_EVENT_PATH")
+          if [ -z "${commits}" ]; then
+            echo "No commits found in event payload; nothing to reapply."
+            exit 0
+          fi
+
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          SHORT_SHA=${GITHUB_SHA::7}
+          BRANCH="reapply/direct-push-${SHORT_SHA}"
+          git clone --no-tags "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git fetch --all
+          git checkout main
+
+          if ! git merge-base --is-ancestor "$REVERT_MERGE_SHA" HEAD; then
+            echo "Revert commit is NOT present on main. Aborting reapply."
+            exit 1
+          fi
+
+          echo "Revert commit detected on main. Safe to reapply."
+
+          git checkout -b "$BRANCH"
+
+          # cherry-pick commits in original order (oldest -> newest)
+          for c in $commits; do
+            echo "Cherry-picking commit $c"
+            parents=$(git rev-list --parents -n 1 "$c" | wc -w | tr -d ' ')
+            if [ "$parents" -gt 2 ]; then
+              git cherry-pick -m 1 "$c"
+            else
+              git cherry-pick "$c"
+              msg=$(git log -1 --pretty=%s)
+              git commit --amend -m "[auto-reapply] $msg"
+            fi
+          done
+
+          git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
+
+          title="Apply direct push ${SHORT_SHA} via PR"
+          body="This PR re-applies commits that were pushed directly to main. It was created automatically after the revert PR was merged.\n\nOriginal direct push SHA: ${GITHUB_SHA}"
+
+          create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API}/repos/${REPO}/pulls" \
+            -d "$(jq -n --arg t "$title" --arg b "$body" --arg h "$BRANCH" '{title:$t, head:$h, base:"main", body:$b}')")
+
+          echo "$create_resp" | jq .
+          pr_number=$(echo "$create_resp" | jq -r '.number // empty')
+          if [ -z "$pr_number" ]; then
+            echo "Failed to create reapply PR. Response:"
+            echo "$create_resp"
+            exit 1
+          fi
+          echo "Reapply PR created: #${pr_number}"
